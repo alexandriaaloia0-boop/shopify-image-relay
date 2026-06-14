@@ -78,3 +78,46 @@ test("relay endpoint blocks localhost with valid authentication", async (t) => {
   assert.equal(response.statusCode, 400);
   assert.equal(response.json().error.code, "BLOCKED_URL");
 });
+
+test("image check endpoint returns public response diagnostics", async (t) => {
+  const checkedUrl =
+    "https://s3.ap-northeast-1.wasabisys.com/shopify-images-ckc/images/test.jpg";
+  const app = await buildApp(
+    config,
+    unusedStorage,
+    async (url) => ({
+      url,
+      httpStatus: 200,
+      contentType: "image/jpeg",
+      contentLength: 1234,
+      cacheControl: "public, max-age=31536000, immutable",
+      contentDisposition: "inline",
+      magicBytes: [255, 216, 255, 224],
+      magicBytesHex: "ffd8ffe0",
+      isJpeg: true
+    })
+  );
+  t.after(() => app.close());
+
+  const response = await app.inject({
+    method: "GET",
+    url: `/v1/images/check?url=${encodeURIComponent(checkedUrl)}`,
+    headers: {
+      authorization: `Bearer ${config.apiKey}`
+    }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.json(), {
+    success: true,
+    url: checkedUrl,
+    httpStatus: 200,
+    contentType: "image/jpeg",
+    contentLength: 1234,
+    cacheControl: "public, max-age=31536000, immutable",
+    contentDisposition: "inline",
+    magicBytes: [255, 216, 255, 224],
+    magicBytesHex: "ffd8ffe0",
+    isJpeg: true
+  });
+});

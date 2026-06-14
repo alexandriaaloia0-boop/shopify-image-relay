@@ -8,6 +8,10 @@ import type { AppConfig } from "../config.js";
 import { AppError } from "../errors.js";
 import type { ImageStorage, ProcessedImage, StoredImage } from "../types.js";
 
+const IMAGE_CONTENT_TYPE = "image/jpeg";
+const IMAGE_CONTENT_DISPOSITION = "inline";
+const IMAGE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+
 function isNotFound(error: unknown): boolean {
   const serviceError = error as Partial<S3ServiceException>;
   return (
@@ -31,25 +35,36 @@ export function createS3Client(config: AppConfig["storage"]): S3Client {
   });
 }
 
-export class S3Storage implements ImageStorage {
-  private readonly client: S3Client;
+function hasCorrectResponseMetadata(metadata: {
+  ContentType?: string | undefined;
+  ContentDisposition?: string | undefined;
+  CacheControl?: string | undefined;
+}): boolean {
+  return (
+    metadata.ContentType?.toLowerCase() === IMAGE_CONTENT_TYPE &&
+    metadata.ContentDisposition?.toLowerCase() === IMAGE_CONTENT_DISPOSITION &&
+    metadata.CacheControl === IMAGE_CACHE_CONTROL
+  );
+}
 
-  constructor(private readonly config: AppConfig["storage"]) {
-    this.client = createS3Client(config);
-  }
+export class S3Storage implements ImageStorage {
+  constructor(
+    private readonly config: AppConfig["storage"],
+    private readonly client: Pick<S3Client, "send"> = createS3Client(config)
+  ) {}
 
   async store(image: ProcessedImage): Promise<StoredImage> {
     const key = `images/${image.sha256}.jpg`;
-    let exists = false;
+    let needsUpload = true;
 
     try {
-      await this.client.send(
+      const existing = await this.client.send(
         new HeadObjectCommand({
           Bucket: this.config.bucket,
           Key: key
         })
       );
-      exists = true;
+      needsUpload = !hasCorrectResponseMetadata(existing);
     } catch (error) {
       if (!isNotFound(error)) {
         throw new AppError(502, "S3_HEAD_FAILED", "Could not check the image in object storage", {
@@ -58,7 +73,7 @@ export class S3Storage implements ImageStorage {
       }
     }
 
-    if (!exists) {
+    if (needsUpload) {
       try {
         await this.client.send(
           new PutObjectCommand({
@@ -66,8 +81,9 @@ export class S3Storage implements ImageStorage {
             Key: key,
             Body: image.buffer,
             ContentLength: image.bytes,
-            ContentType: "image/jpeg",
-            CacheControl: "public, max-age=31536000, immutable"
+            ContentType: IMAGE_CONTENT_TYPE,
+            ContentDisposition: IMAGE_CONTENT_DISPOSITION,
+            CacheControl: IMAGE_CACHE_CONTROL
           })
         );
       } catch (error) {
@@ -79,7 +95,7 @@ export class S3Storage implements ImageStorage {
 
     return {
       url: `${this.config.publicBaseUrl}/${key}`,
-      uploaded: !exists
+      uploaded: needsUpload
     };
   }
 }

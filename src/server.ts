@@ -3,12 +3,14 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { loadConfig, type AppConfig } from "./config.js";
 import { AppError } from "./errors.js";
 import { registerImageRoutes } from "./routes/images.js";
+import { checkPublicImage } from "./services/public-image-checker.js";
 import { S3Storage } from "./services/s3-storage.js";
 import type { ImageStorage } from "./types.js";
 
 export async function buildApp(
   config: AppConfig = loadConfig(),
-  storage: ImageStorage = new S3Storage(config.storage)
+  storage: ImageStorage = new S3Storage(config.storage),
+  checkImage: typeof checkPublicImage = checkPublicImage
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger:
@@ -26,7 +28,7 @@ export async function buildApp(
     service: "shopify-image-relay"
   }));
 
-  await registerImageRoutes(app, config, storage);
+  await registerImageRoutes(app, config, storage, checkImage);
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof AppError) {

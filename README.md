@@ -20,6 +20,9 @@
 - SSRF 防护：拦截 localhost、回环、私有、链路本地、CGNAT 和其他非公网 IP
 - 每次重定向都重新执行协议、DNS 和公网 IP 校验
 - 下载失败日志包含 URL、HTTP 状态码和底层错误消息
+- Wasabi 对象使用 `.jpg`，并设置标准 HTTP 响应元数据
+- 上传后自动 GET 公开 URL，验证状态码、MIME 和 JPEG 魔数
+- `GET /v1/images/check` 可诊断公开图片 URL
 
 ## 项目结构
 
@@ -34,6 +37,7 @@ shopify-image-relay/
 │   ├── services/
 │   │   ├── downloader.ts
 │   │   ├── image-processor.ts
+│   │   ├── public-image-checker.ts
 │   │   └── s3-storage.ts
 │   ├── config.ts
 │   ├── errors.ts
@@ -42,6 +46,7 @@ shopify-image-relay/
 ├── tests/
 │   ├── downloader.test.ts
 │   ├── image-processor.test.ts
+│   ├── public-image-checker.test.ts
 │   ├── s3-storage.test.ts
 │   ├── server.test.ts
 │   └── url-validator.test.ts
@@ -251,6 +256,43 @@ curl -X POST http://localhost:3000/v1/images/relay \
   -d '{"url":"https://example.com/image.jpg"}'
 ```
 
+relay 在上传完成后会立即 GET 返回的 Wasabi URL。只有以下条件同时满足时才返回成功：
+
+- HTTP 状态为 `200`
+- `Content-Type` 为 `image/jpeg`
+- 文件前三个字节符合 JPEG 魔数 `ff d8 ff`
+
+否则接口返回 `PUBLIC_IMAGE_VERIFICATION_FAILED`，Render 日志会包含公开 URL、响应头和 magic bytes，避免继续把无法处理的 URL 发给 Shopify。
+
+### `GET /v1/images/check`
+
+检查一个公开图片 URL，不跟随重定向。该接口也需要相同的 Bearer API Key。
+
+```bash
+curl --get "https://你的中转服务域名/v1/images/check" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  --data-urlencode "url=https://s3.ap-northeast-1.wasabisys.com/shopify-images-ckc/images/example.jpg"
+```
+
+示例响应：
+
+```json
+{
+  "success": true,
+  "url": "https://s3.ap-northeast-1.wasabisys.com/shopify-images-ckc/images/example.jpg",
+  "httpStatus": 200,
+  "contentType": "image/jpeg",
+  "contentLength": 300000,
+  "cacheControl": "public, max-age=31536000, immutable",
+  "contentDisposition": "inline",
+  "magicBytes": [255, 216, 255, 224, 0, 16],
+  "magicBytesHex": "ffd8ffe000104a46494600010200000100010000",
+  "isJpeg": true
+}
+```
+
+如果 Wasabi 返回 XML 权限错误、HTML 页面或 3xx 重定向，`httpStatus`、`contentType`、magic bytes 和 `isJpeg` 会直接显示实际结果。
+
 ## 图片处理规则
 
 1. 下载上限默认 15MB，由 `MAX_DOWNLOAD_BYTES` 配置。
@@ -264,7 +306,19 @@ curl -X POST http://localhost:3000/v1/images/relay \
 9. 输出 sRGB JPEG，初始 quality 82。
 10. 超过 5MB 时逐步降低质量，必要时继续降低尺寸。
 11. 对最终 JPEG 计算 SHA-256，保存为 `images/<sha256>.jpg`。
-12. 上传时设置 `Content-Type: image/jpeg` 和长期缓存头。
+12. 上传 key 固定为 `images/<sha256>.jpg`。
+13. `PutObjectCommand` 顶层设置：
+
+```text
+ContentType: image/jpeg
+ContentDisposition: inline
+CacheControl: public, max-age=31536000, immutable
+```
+
+这些是 S3 对象的标准 HTTP 响应元数据，不放在自定义 `Metadata` 字段中。
+
+14. 已存在的哈希对象会通过 `HeadObject` 检查上述元数据；不正确时自动覆盖上传。
+15. 上传后立即检查公开 URL，确认 Shopify 获取到的是 JPEG 二进制而非 XML、HTML 或重定向响应。
 
 ## 测试与构建
 
