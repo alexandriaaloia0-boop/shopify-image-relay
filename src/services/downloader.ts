@@ -1,182 +1,127 @@
-import http, { type IncomingHttpHeaders } from "node:http";
-import https from "node:https";
-import type { LookupFunction } from "node:net";
 import type { AppConfig } from "../config.js";
 import { AppError } from "../errors.js";
-import {
-  resolvePublicTarget,
-  type ResolvedTarget
-} from "../security/url-validator.js";
+import { resolvePublicTarget } from "../security/url-validator.js";
 
-interface DownloadResponse {
-  kind: "image";
-  buffer: Buffer;
+interface DownloadLogger {
+  error(bindings: Record<string, unknown>, message: string): void;
 }
 
-interface RedirectResponse {
-  kind: "redirect";
-  location: string;
+interface DownloaderDependencies {
+  fetchImpl?: typeof fetch;
+  validateUrl?: (url: URL) => Promise<unknown>;
+  logger?: DownloadLogger;
 }
-
-type RequestResult = DownloadResponse | RedirectResponse;
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
-function parseContentLength(headers: IncomingHttpHeaders): number | undefined {
-  const rawValue = headers["content-length"];
+const REQUEST_HEADERS = {
+  "User-Agent": "Mozilla/5.0",
+  Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9"
+};
+
+function parseContentLength(response: Response): number | undefined {
+  const rawValue = response.headers.get("content-length");
 
   if (!rawValue) {
     return undefined;
   }
 
-  const value = Number(Array.isArray(rawValue) ? rawValue[0] : rawValue);
+  const value = Number(rawValue);
   return Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
-function requestOnce(
+function getOriginalErrorMessage(error: unknown): string {
+  let current = error;
+  let message = error instanceof Error ? error.message : String(error);
+
+  while (
+    current instanceof Error &&
+    "cause" in current &&
+    current.cause !== undefined
+  ) {
+    current = current.cause;
+    message = current instanceof Error ? current.message : String(current);
+  }
+
+  return message;
+}
+
+function logDownloadFailure(
+  logger: DownloadLogger | undefined,
   url: URL,
-  target: ResolvedTarget,
-  timeoutMs: number,
-  maxBytes: number
-): Promise<RequestResult> {
-  return new Promise((resolve, reject) => {
-    const transport = url.protocol === "https:" ? https : http;
-    const lookup: LookupFunction = (_hostname, _options, callback) => {
-      callback(null, target.address, target.family);
-    };
+  error: unknown,
+  statusCode?: number
+): void {
+  logger?.error(
+    {
+      url: url.toString(),
+      ...(statusCode !== undefined ? { statusCode } : {}),
+      errorCode: error instanceof AppError ? error.code : "DOWNLOAD_FAILED",
+      originalError: getOriginalErrorMessage(error)
+    },
+    "remote image download failed"
+  );
+}
 
-    let settled = false;
-    let timer: NodeJS.Timeout | undefined;
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // The original download error is more useful than a cleanup failure.
+  }
+}
 
-    const finish = (result: RequestResult): void => {
-      if (settled) {
-        return;
-      }
+async function readResponseBody(response: Response, maxBytes: number): Promise<Buffer> {
+  const contentLength = parseContentLength(response);
 
-      settled = true;
-      if (timer) {
-        clearTimeout(timer);
-      }
-      resolve(result);
-    };
-
-    const fail = (error: unknown): void => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      if (timer) {
-        clearTimeout(timer);
-      }
-      reject(
-        error instanceof AppError
-          ? error
-          : new AppError(502, "DOWNLOAD_FAILED", "Failed to download the remote image", {
-              cause: error
-            })
-      );
-    };
-
-    const request = transport.request(
-      {
-        protocol: url.protocol,
-        hostname: url.hostname,
-        method: "GET",
-        path: `${url.pathname}${url.search}`,
-        lookup,
-        headers: {
-          Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
-          "Accept-Encoding": "identity",
-          "User-Agent": "ShopifyImageRelay/1.0"
-        },
-        ...(url.port ? { port: url.port } : {})
-      },
-      (response) => {
-        const statusCode = response.statusCode ?? 0;
-
-        if (REDIRECT_STATUSES.has(statusCode)) {
-          const location = response.headers.location;
-          response.resume();
-
-          if (!location) {
-            fail(new AppError(502, "INVALID_REDIRECT", "Remote server returned an empty redirect"));
-            return;
-          }
-
-          finish({ kind: "redirect", location });
-          return;
-        }
-
-        if (statusCode < 200 || statusCode >= 300) {
-          response.resume();
-          fail(
-            new AppError(
-              502,
-              "REMOTE_HTTP_ERROR",
-              `Remote image server returned HTTP ${statusCode}`
-            )
-          );
-          return;
-        }
-
-        const contentLength = parseContentLength(response.headers);
-
-        if (contentLength !== undefined && contentLength > maxBytes) {
-          response.resume();
-          fail(
-            new AppError(
-              413,
-              "DOWNLOAD_TOO_LARGE",
-              `Remote image exceeds the ${maxBytes} byte download limit`
-            )
-          );
-          return;
-        }
-
-        const chunks: Buffer[] = [];
-        let receivedBytes = 0;
-
-        response.on("data", (chunk: Buffer) => {
-          receivedBytes += chunk.length;
-
-          if (receivedBytes > maxBytes) {
-            response.destroy();
-            fail(
-              new AppError(
-                413,
-                "DOWNLOAD_TOO_LARGE",
-                `Remote image exceeds the ${maxBytes} byte download limit`
-              )
-            );
-            return;
-          }
-
-          chunks.push(chunk);
-        });
-
-        response.on("end", () => {
-          if (receivedBytes === 0) {
-            fail(new AppError(422, "EMPTY_FILE", "Remote image response was empty"));
-            return;
-          }
-
-          finish({ kind: "image", buffer: Buffer.concat(chunks, receivedBytes) });
-        });
-
-        response.on("error", fail);
-      }
+  if (contentLength !== undefined && contentLength > maxBytes) {
+    await cancelResponseBody(response);
+    throw new AppError(
+      413,
+      "DOWNLOAD_TOO_LARGE",
+      `Remote image exceeds the ${maxBytes} byte download limit`
     );
+  }
 
-    timer = setTimeout(() => {
-      request.destroy(
-        new AppError(504, "DOWNLOAD_TIMEOUT", `Image download exceeded ${timeoutMs}ms`)
-      );
-    }, timeoutMs);
+  if (!response.body) {
+    throw new AppError(422, "EMPTY_FILE", "Remote image response was empty");
+  }
 
-    request.on("error", fail);
-    request.end();
-  });
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let receivedBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      receivedBytes += value.byteLength;
+
+      if (receivedBytes > maxBytes) {
+        await reader.cancel();
+        throw new AppError(
+          413,
+          "DOWNLOAD_TOO_LARGE",
+          `Remote image exceeds the ${maxBytes} byte download limit`
+        );
+      }
+
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (receivedBytes === 0) {
+    throw new AppError(422, "EMPTY_FILE", "Remote image response was empty");
+  }
+
+  return Buffer.concat(chunks, receivedBytes);
 }
 
 export async function downloadRemoteImage(
@@ -184,8 +129,11 @@ export async function downloadRemoteImage(
   config: Pick<
     AppConfig,
     "downloadTimeoutMs" | "maxDownloadBytes" | "maxRedirects"
-  >
+  >,
+  dependencies: DownloaderDependencies = {}
 ): Promise<Buffer> {
+  const fetchImpl = dependencies.fetchImpl ?? fetch;
+  const validateUrl = dependencies.validateUrl ?? resolvePublicTarget;
   let currentUrl: URL;
 
   try {
@@ -194,28 +142,120 @@ export async function downloadRemoteImage(
     throw new AppError(400, "INVALID_URL", "url must be a valid absolute URL");
   }
 
-  for (let redirectCount = 0; redirectCount <= config.maxRedirects; redirectCount += 1) {
-    const target = await resolvePublicTarget(currentUrl);
-    const result = await requestOnce(
-      currentUrl,
-      target,
-      config.downloadTimeoutMs,
-      config.maxDownloadBytes
-    );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.downloadTimeoutMs);
 
-    if (result.kind === "image") {
-      return result.buffer;
-    }
+  try {
+    for (let redirectCount = 0; redirectCount <= config.maxRedirects; redirectCount += 1) {
+      try {
+        await validateUrl(currentUrl);
+      } catch (error) {
+        logDownloadFailure(dependencies.logger, currentUrl, error);
+        throw error;
+      }
 
-    if (redirectCount === config.maxRedirects) {
-      throw new AppError(502, "TOO_MANY_REDIRECTS", "Remote image returned too many redirects");
-    }
+      let response: Response;
 
-    try {
-      currentUrl = new URL(result.location, currentUrl);
-    } catch {
-      throw new AppError(502, "INVALID_REDIRECT", "Remote server returned an invalid redirect URL");
+      try {
+        response = await fetchImpl(currentUrl, {
+          method: "GET",
+          headers: REQUEST_HEADERS,
+          redirect: "manual",
+          signal: controller.signal
+        });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          const timeoutError = new AppError(
+            504,
+            "DOWNLOAD_TIMEOUT",
+            `Image download exceeded ${config.downloadTimeoutMs}ms`,
+            { cause: error }
+          );
+          logDownloadFailure(dependencies.logger, currentUrl, timeoutError);
+          throw timeoutError;
+        }
+
+        const downloadError = new AppError(
+          502,
+          "DOWNLOAD_FAILED",
+          `Failed to download the remote image: ${getOriginalErrorMessage(error)}`,
+          { cause: error }
+        );
+        logDownloadFailure(dependencies.logger, currentUrl, downloadError);
+        throw downloadError;
+      }
+
+      if (REDIRECT_STATUSES.has(response.status)) {
+        const location = response.headers.get("location");
+        await cancelResponseBody(response);
+
+        if (!location) {
+          const error = new AppError(
+            502,
+            "INVALID_REDIRECT",
+            "Remote server returned an empty redirect"
+          );
+          logDownloadFailure(dependencies.logger, currentUrl, error, response.status);
+          throw error;
+        }
+
+        if (redirectCount === config.maxRedirects) {
+          const error = new AppError(
+            502,
+            "TOO_MANY_REDIRECTS",
+            "Remote image returned too many redirects"
+          );
+          logDownloadFailure(dependencies.logger, currentUrl, error, response.status);
+          throw error;
+        }
+
+        try {
+          currentUrl = new URL(location, currentUrl);
+        } catch (cause) {
+          const error = new AppError(
+            502,
+            "INVALID_REDIRECT",
+            "Remote server returned an invalid redirect URL",
+            { cause }
+          );
+          logDownloadFailure(dependencies.logger, currentUrl, error, response.status);
+          throw error;
+        }
+
+        continue;
+      }
+
+      if (!response.ok) {
+        await cancelResponseBody(response);
+        const error = new AppError(
+          502,
+          "REMOTE_HTTP_ERROR",
+          `REMOTE_HTTP_ERROR HTTP ${response.status}`
+        );
+        logDownloadFailure(dependencies.logger, currentUrl, error, response.status);
+        throw error;
+      }
+
+      try {
+        return await readResponseBody(response, config.maxDownloadBytes);
+      } catch (error) {
+        if (controller.signal.aborted && !(error instanceof AppError)) {
+          const timeoutError = new AppError(
+            504,
+            "DOWNLOAD_TIMEOUT",
+            `Image download exceeded ${config.downloadTimeoutMs}ms`,
+            { cause: error }
+          );
+          logDownloadFailure(dependencies.logger, currentUrl, timeoutError, response.status);
+          throw timeoutError;
+        }
+
+        logDownloadFailure(dependencies.logger, currentUrl, error, response.status);
+        throw error;
+      }
     }
+  } finally {
+    clearTimeout(timeout);
   }
 
   throw new AppError(502, "DOWNLOAD_FAILED", "Failed to download the remote image");

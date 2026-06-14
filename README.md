@@ -9,6 +9,7 @@
 ## 功能
 
 - Node.js + TypeScript + Fastify
+- Node.js 22 原生 `fetch` 下载远程图片
 - `file-type` 检测真实文件格式，不依赖 URL 后缀或远端 `Content-Type`
 - Sharp 自动旋转并限制最长边为 2048px
 - 优先使用 JPEG quality 82，超过 5MB 时逐步降低质量和尺寸
@@ -17,7 +18,8 @@
 - Bearer API Key 鉴权
 - 下载超时、大小限制和重定向次数限制
 - SSRF 防护：拦截 localhost、回环、私有、链路本地、CGNAT 和其他非公网 IP
-- 每次重定向都重新校验目标，并将连接固定到已验证的公网 IP
+- 每次重定向都重新执行协议、DNS 和公网 IP 校验
+- 下载失败日志包含 URL、HTTP 状态码和底层错误消息
 
 ## 项目结构
 
@@ -38,6 +40,7 @@ shopify-image-relay/
 │   ├── server.ts
 │   └── types.ts
 ├── tests/
+│   ├── downloader.test.ts
 │   ├── image-processor.test.ts
 │   ├── s3-storage.test.ts
 │   ├── server.test.ts
@@ -228,6 +231,17 @@ Content-Type: application/json
 }
 ```
 
+远程下载失败时，Render 日志会包含类似字段：
+
+```json
+{
+  "url": "https://example.com/image.jpg",
+  "statusCode": 404,
+  "errorCode": "REMOTE_HTTP_ERROR",
+  "originalError": "REMOTE_HTTP_ERROR HTTP 404"
+}
+```
+
 调用示例：
 
 ```bash
@@ -241,14 +255,16 @@ curl -X POST http://localhost:3000/v1/images/relay \
 
 1. 下载上限默认 15MB，由 `MAX_DOWNLOAD_BYTES` 配置。
 2. 下载超时默认 15 秒，由 `DOWNLOAD_TIMEOUT_MS` 配置。
-3. 使用 `file-type` 从二进制内容识别图片。
-4. 使用 Sharp 解码验证、读取 EXIF 方向并自动旋转。
-5. 最长边限制为 2048px，不放大小图片。
-6. 去除原始元数据，透明区域使用白色背景。
-7. 输出 sRGB JPEG，初始 quality 82。
-8. 超过 5MB 时逐步降低质量，必要时继续降低尺寸。
-9. 对最终 JPEG 计算 SHA-256，保存为 `images/<sha256>.jpg`。
-10. 上传时设置 `Content-Type: image/jpeg` 和长期缓存头。
+3. 使用 Node.js 22 原生 `fetch`，并发送浏览器风格的图片请求头。
+4. 重定向由应用手动处理，每次跳转后重新执行协议、DNS 和公网 IP 校验。
+5. 使用 `file-type` 从二进制内容识别图片。
+6. 使用 Sharp 解码验证、读取 EXIF 方向并自动旋转。
+7. 最长边限制为 2048px，不放大小图片。
+8. 去除原始元数据，透明区域使用白色背景。
+9. 输出 sRGB JPEG，初始 quality 82。
+10. 超过 5MB 时逐步降低质量，必要时继续降低尺寸。
+11. 对最终 JPEG 计算 SHA-256，保存为 `images/<sha256>.jpg`。
+12. 上传时设置 `Content-Type: image/jpeg` 和长期缓存头。
 
 ## 测试与构建
 

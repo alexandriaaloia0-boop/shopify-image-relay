@@ -43,7 +43,9 @@ export async function registerImageRoutes(
       }
     },
     async (request, reply) => {
-      const source = await downloadRemoteImage(request.body.url, config);
+      const source = await downloadRemoteImage(request.body.url, config, {
+        logger: request.log
+      });
       const image = await processImage(source, {
         maxOutputBytes: config.maxOutputBytes,
         maxInputPixels: config.maxInputPixels
