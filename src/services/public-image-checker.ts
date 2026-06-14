@@ -3,6 +3,7 @@ import { AppError } from "../errors.js";
 import { resolvePublicTarget } from "../security/url-validator.js";
 
 const MAGIC_BYTES_LENGTH = 20;
+const RESPONSE_PREVIEW_BYTES = 500;
 
 interface CheckerDependencies {
   fetchImpl?: typeof fetch;
@@ -18,6 +19,7 @@ export interface PublicImageCheck {
   contentDisposition: string | null;
   magicBytes: number[];
   magicBytesHex: string;
+  responsePreview: string | null;
   isJpeg: boolean;
 }
 
@@ -34,7 +36,7 @@ function isJpegMagicBytes(bytes: Buffer): boolean {
   return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
 }
 
-async function readFirstBytes(response: Response, limit: number): Promise<Buffer> {
+async function readResponsePrefix(response: Response, limit: number): Promise<Buffer> {
   if (!response.body) {
     return Buffer.alloc(0);
   }
@@ -99,8 +101,13 @@ export async function checkPublicImage(
       signal: controller.signal
     });
 
-    const firstBytes = await readFirstBytes(response, MAGIC_BYTES_LENGTH);
+    const responsePrefix = await readResponsePrefix(response, RESPONSE_PREVIEW_BYTES);
+    const firstBytes = responsePrefix.subarray(0, MAGIC_BYTES_LENGTH);
     const contentType = response.headers.get("content-type");
+    const isSuccessfulJpeg =
+      response.status === 200 &&
+      contentType?.split(";", 1)[0]?.trim().toLowerCase() === "image/jpeg" &&
+      isJpegMagicBytes(firstBytes);
 
     return {
       url: url.toString(),
@@ -111,10 +118,10 @@ export async function checkPublicImage(
       contentDisposition: response.headers.get("content-disposition"),
       magicBytes: [...firstBytes],
       magicBytesHex: firstBytes.toString("hex"),
-      isJpeg:
-        response.status === 200 &&
-        contentType?.split(";", 1)[0]?.trim().toLowerCase() === "image/jpeg" &&
-        isJpegMagicBytes(firstBytes)
+      responsePreview: isSuccessfulJpeg
+        ? null
+        : new TextDecoder("utf-8").decode(responsePrefix).slice(0, 500),
+      isJpeg: isSuccessfulJpeg
     };
   } catch (error) {
     if (error instanceof AppError) {

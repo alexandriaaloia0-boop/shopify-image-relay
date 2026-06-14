@@ -125,7 +125,19 @@ export async function registerImageRoutes(
           },
           "public image verification request failed"
         );
-        throw error;
+        throw new AppError(
+          502,
+          "PUBLIC_IMAGE_VERIFICATION_FAILED",
+          `Public image verification request failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          {
+            cause: error,
+            details: {
+              debugPublicUrl: stored.url
+            }
+          }
+        );
       }
 
       request.log.info(
@@ -147,7 +159,12 @@ export async function registerImageRoutes(
           "PUBLIC_IMAGE_VERIFICATION_FAILED",
           `Public image verification failed: HTTP ${publicCheck.httpStatus}, content-type ${
             publicCheck.contentType ?? "missing"
-          }, JPEG magic ${publicCheck.magicBytesHex || "missing"}`
+          }, JPEG magic ${publicCheck.magicBytesHex || "missing"}`,
+          {
+            details: {
+              debugPublicUrl: stored.url
+            }
+          }
         );
       }
 

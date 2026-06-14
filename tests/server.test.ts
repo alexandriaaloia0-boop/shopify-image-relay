@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AppConfig } from "../src/config.js";
+import { AppError } from "../src/errors.js";
 import { buildApp } from "../src/server.js";
 import type { ImageStorage } from "../src/types.js";
 
@@ -94,6 +95,7 @@ test("image check endpoint returns public response diagnostics", async (t) => {
       contentDisposition: "inline",
       magicBytes: [255, 216, 255, 224],
       magicBytesHex: "ffd8ffe0",
+      responsePreview: null,
       isJpeg: true
     })
   );
@@ -118,6 +120,47 @@ test("image check endpoint returns public response diagnostics", async (t) => {
     contentDisposition: "inline",
     magicBytes: [255, 216, 255, 224],
     magicBytesHex: "ffd8ffe0",
+    responsePreview: null,
     isJpeg: true
+  });
+});
+
+test("error responses can expose only the safe debug public URL", async (t) => {
+  const debugPublicUrl =
+    "https://s3.ap-northeast-1.wasabisys.com/shopify-images-ckc/images/private.jpg";
+  const app = await buildApp(
+    config,
+    unusedStorage,
+    async () => {
+      throw new AppError(
+        502,
+        "PUBLIC_IMAGE_VERIFICATION_FAILED",
+        "Public image verification failed",
+        {
+          details: {
+            debugPublicUrl
+          }
+        }
+      );
+    }
+  );
+  t.after(() => app.close());
+
+  const response = await app.inject({
+    method: "GET",
+    url: `/v1/images/check?url=${encodeURIComponent(debugPublicUrl)}`,
+    headers: {
+      authorization: `Bearer ${config.apiKey}`
+    }
+  });
+
+  assert.equal(response.statusCode, 502);
+  assert.deepEqual(response.json(), {
+    success: false,
+    error: {
+      code: "PUBLIC_IMAGE_VERIFICATION_FAILED",
+      message: "Public image verification failed",
+      debugPublicUrl
+    }
   });
 });

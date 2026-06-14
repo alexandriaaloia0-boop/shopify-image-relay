@@ -42,7 +42,8 @@ export async function buildApp(
         success: false,
         error: {
           code: error.code,
-          message: error.message
+          message: error.message,
+          ...error.details
         }
       });
     }

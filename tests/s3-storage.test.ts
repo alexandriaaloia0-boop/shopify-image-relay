@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AppConfig } from "../src/config.js";
 import {
+  GetObjectAclCommand,
   HeadObjectCommand,
   PutObjectCommand,
   type S3Client
 } from "@aws-sdk/client-s3";
 import {
+  buildPublicObjectUrl,
   createS3Client,
   S3Storage
 } from "../src/services/s3-storage.js";
@@ -73,6 +75,7 @@ test("uploads .jpg objects with standard HTTP response metadata", async () => {
   assert.ok(put);
   assert.equal(put.input.Bucket, "shopify-images-ckc");
   assert.equal(put.input.Key, `images/${"a".repeat(64)}.jpg`);
+  assert.equal(put.input.ACL, "public-read");
   assert.equal(put.input.ContentType, "image/jpeg");
   assert.equal(put.input.ContentDisposition, "inline");
   assert.equal(
@@ -85,6 +88,16 @@ test("uploads .jpg objects with standard HTTP response metadata", async () => {
     `https://s3.ap-northeast-1.wasabisys.com/shopify-images-ckc/images/${"a".repeat(64)}.jpg`
   );
   assert.equal(result.uploaded, true);
+});
+
+test("builds a direct Wasabi path-style public URL without duplicate slashes", () => {
+  assert.equal(
+    buildPublicObjectUrl(
+      "https://s3.ap-northeast-1.wasabisys.com/shopify-images-ckc/",
+      "images/test image.jpg"
+    ),
+    "https://s3.ap-northeast-1.wasabisys.com/shopify-images-ckc/images/test%20image.jpg"
+  );
 });
 
 test("rewrites an existing object when its response metadata is stale", async () => {
@@ -120,4 +133,91 @@ test("rewrites an existing object when its response metadata is stale", async ()
     commands.some((command) => command instanceof PutObjectCommand),
     true
   );
+});
+
+test("keeps an existing object only when it has public-read ACL", async () => {
+  const commands: unknown[] = [];
+  const client = {
+    async send(command: unknown) {
+      commands.push(command);
+
+      if (command instanceof HeadObjectCommand) {
+        return {
+          ContentType: "image/jpeg",
+          CacheControl: "public, max-age=31536000, immutable",
+          ContentDisposition: "inline"
+        };
+      }
+
+      if (command instanceof GetObjectAclCommand) {
+        return {
+          Grants: [
+            {
+              Grantee: {
+                Type: "Group",
+                URI: "http://acs.amazonaws.com/groups/global/AllUsers"
+              },
+              Permission: "READ"
+            }
+          ]
+        };
+      }
+
+      return {};
+    }
+  } as unknown as Pick<S3Client, "send">;
+
+  const storage = new S3Storage(storageConfig, client);
+  const result = await storage.store({
+    buffer: Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+    format: "jpeg",
+    width: 1,
+    height: 1,
+    bytes: 4,
+    sha256: "c".repeat(64)
+  });
+
+  assert.equal(result.uploaded, false);
+  assert.equal(
+    commands.some((command) => command instanceof PutObjectCommand),
+    false
+  );
+});
+
+test("rewrites an existing private object with public-read ACL", async () => {
+  const commands: unknown[] = [];
+  const client = {
+    async send(command: unknown) {
+      commands.push(command);
+
+      if (command instanceof HeadObjectCommand) {
+        return {
+          ContentType: "image/jpeg",
+          CacheControl: "public, max-age=31536000, immutable",
+          ContentDisposition: "inline"
+        };
+      }
+
+      if (command instanceof GetObjectAclCommand) {
+        return { Grants: [] };
+      }
+
+      return {};
+    }
+  } as unknown as Pick<S3Client, "send">;
+
+  const storage = new S3Storage(storageConfig, client);
+  await storage.store({
+    buffer: Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+    format: "jpeg",
+    width: 1,
+    height: 1,
+    bytes: 4,
+    sha256: "d".repeat(64)
+  });
+
+  const put = commands.find(
+    (command): command is PutObjectCommand => command instanceof PutObjectCommand
+  );
+  assert.equal(put?.input.ACL, "public-read");
 });

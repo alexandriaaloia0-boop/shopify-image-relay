@@ -62,8 +62,35 @@ function normalizeHttpUrl(name: string, value: string): string {
   return value.replace(/\/+$/, "");
 }
 
+function normalizePublicBaseUrl(value: string, bucket: string): string {
+  const normalized = normalizeHttpUrl("WASABI_PUBLIC_BASE_URL", value);
+  const parsed = new URL(normalized);
+
+  if (parsed.hostname.endsWith(".wasabisys.com")) {
+    const segments = parsed.pathname.split("/").filter(Boolean);
+
+    if (segments.length === 0) {
+      segments.push(bucket);
+    } else if (segments.at(-1) !== bucket) {
+      throw new AppError(
+        500,
+        "CONFIG_ERROR",
+        `WASABI_PUBLIC_BASE_URL must end with /${bucket} for a Wasabi service URL`
+      );
+    }
+
+    parsed.pathname = `/${segments.join("/")}`;
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/+$/, "");
+  }
+
+  return normalized;
+}
+
 export function loadConfig(): AppConfig {
   const apiKey = required("API_KEY");
+  const bucket = required("WASABI_BUCKET");
 
   if (apiKey.length < 16) {
     throw new AppError(500, "CONFIG_ERROR", "API_KEY must contain at least 16 characters");
@@ -79,11 +106,8 @@ export function loadConfig(): AppConfig {
       region: required("WASABI_REGION"),
       accessKeyId: required("WASABI_ACCESS_KEY_ID"),
       secretAccessKey: required("WASABI_SECRET_ACCESS_KEY"),
-      bucket: required("WASABI_BUCKET"),
-      publicBaseUrl: normalizeHttpUrl(
-        "WASABI_PUBLIC_BASE_URL",
-        required("WASABI_PUBLIC_BASE_URL")
-      )
+      bucket,
+      publicBaseUrl: normalizePublicBaseUrl(required("WASABI_PUBLIC_BASE_URL"), bucket)
     },
     downloadTimeoutMs: positiveInteger("DOWNLOAD_TIMEOUT_MS", 15_000),
     maxDownloadBytes: positiveInteger("MAX_DOWNLOAD_BYTES", 15 * 1024 * 1024),

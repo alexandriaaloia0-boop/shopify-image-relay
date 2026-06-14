@@ -1,7 +1,9 @@
 import {
+  GetObjectAclCommand,
   HeadObjectCommand,
   PutObjectCommand,
   S3Client,
+  type GetObjectAclCommandOutput,
   type S3ServiceException
 } from "@aws-sdk/client-s3";
 import type { AppConfig } from "../config.js";
@@ -11,6 +13,8 @@ import type { ImageStorage, ProcessedImage, StoredImage } from "../types.js";
 const IMAGE_CONTENT_TYPE = "image/jpeg";
 const IMAGE_CONTENT_DISPOSITION = "inline";
 const IMAGE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+const PUBLIC_READ_ACL = "public-read";
+const ALL_USERS_GROUP = "http://acs.amazonaws.com/groups/global/AllUsers";
 
 function isNotFound(error: unknown): boolean {
   const serviceError = error as Partial<S3ServiceException>;
@@ -47,6 +51,34 @@ function hasCorrectResponseMetadata(metadata: {
   );
 }
 
+function hasPublicReadAcl(
+  grants: GetObjectAclCommandOutput["Grants"]
+): boolean {
+  return (
+    grants?.some(
+      (grant) =>
+        grant.Grantee?.Type === "Group" &&
+        grant.Grantee.URI === ALL_USERS_GROUP &&
+        grant.Permission === "READ"
+    ) ?? false
+  );
+}
+
+export function buildPublicObjectUrl(publicBaseUrl: string, key: string): string {
+  const url = new URL(publicBaseUrl);
+  const basePath = url.pathname.replace(/\/+$/, "");
+  const encodedKey = key
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+
+  url.pathname = `${basePath}/${encodedKey}`.replace(/\/{2,}/g, "/");
+  url.search = "";
+  url.hash = "";
+
+  return url.toString();
+}
+
 export class S3Storage implements ImageStorage {
   constructor(
     private readonly config: AppConfig["storage"],
@@ -65,6 +97,21 @@ export class S3Storage implements ImageStorage {
         })
       );
       needsUpload = !hasCorrectResponseMetadata(existing);
+
+      if (!needsUpload) {
+        try {
+          const acl = await this.client.send(
+            new GetObjectAclCommand({
+              Bucket: this.config.bucket,
+              Key: key
+            })
+          );
+          needsUpload = !hasPublicReadAcl(acl.Grants);
+        } catch {
+          // Re-uploading with public-read is safer than trusting an unknown ACL.
+          needsUpload = true;
+        }
+      }
     } catch (error) {
       if (!isNotFound(error)) {
         throw new AppError(502, "S3_HEAD_FAILED", "Could not check the image in object storage", {
@@ -81,6 +128,7 @@ export class S3Storage implements ImageStorage {
             Key: key,
             Body: image.buffer,
             ContentLength: image.bytes,
+            ACL: PUBLIC_READ_ACL,
             ContentType: IMAGE_CONTENT_TYPE,
             ContentDisposition: IMAGE_CONTENT_DISPOSITION,
             CacheControl: IMAGE_CACHE_CONTROL
@@ -94,7 +142,7 @@ export class S3Storage implements ImageStorage {
     }
 
     return {
-      url: `${this.config.publicBaseUrl}/${key}`,
+      url: buildPublicObjectUrl(this.config.publicBaseUrl, key),
       uploaded: needsUpload
     };
   }
